@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Claude → Obsidian KG",
+  "version": "1.0.0",
+  "description": "Auto-builds Obsidian knowledge graph from Claude conversations",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "http://127.0.0.1:7842/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png"
+    }
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png"
+  }
+}

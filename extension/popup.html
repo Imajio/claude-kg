@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    width: 260px;
+    background: #0f0f1a;
+    color: #e0e0e0;
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 13px;
+  }
+
+  .header {
+    padding: 16px;
+    border-bottom: 1px solid #1e1e30;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .logo {
+    width: 28px;
+    height: 28px;
+    background: linear-gradient(135deg, #6c63ff, #3ecfcf);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+  }
+
+  .title {
+    font-weight: 600;
+    font-size: 14px;
+    color: #fff;
+  }
+
+  .subtitle {
+    font-size: 11px;
+    color: #666;
+    margin-top: 1px;
+  }
+
+  .body {
+    padding: 14px 16px;
+  }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    margin-bottom: 14px;
+    font-size: 12px;
+  }
+
+  .status.ok    { background: #0d2b1a; color: #4caf50; border: 1px solid #1a4a2a; }
+  .status.error { background: #2b0d0d; color: #f44336; border: 1px solid #4a1a1a; }
+  .status.checking { background: #1a1a2e; color: #888; border: 1px solid #2a2a40; }
+
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+    flex-shrink: 0;
+  }
+
+  .btn {
+    width: 100%;
+    padding: 10px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    transition: opacity 0.15s;
+    margin-bottom: 8px;
+  }
+
+  .btn:hover { opacity: 0.85; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn-primary {
+    background: linear-gradient(135deg, #6c63ff, #3ecfcf);
+    color: #fff;
+  }
+
+  .btn-secondary {
+    background: #1e1e30;
+    color: #aaa;
+    border: 1px solid #2a2a40;
+  }
+
+  .msg {
+    font-size: 11px;
+    color: #666;
+    text-align: center;
+    padding: 4px 0;
+    min-height: 18px;
+  }
+
+  .msg.success { color: #4caf50; }
+  .msg.error   { color: #f44336; }
+
+  .divider {
+    border: none;
+    border-top: 1px solid #1e1e30;
+    margin: 12px 0;
+  }
+
+  .hint {
+    font-size: 11px;
+    color: #555;
+    line-height: 1.5;
+  }
+
+  .hint code {
+    background: #1a1a2e;
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #888;
+    font-family: monospace;
+    font-size: 10px;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">🧠</div>
+  <div>
+    <div class="title">Claude → Obsidian</div>
+    <div class="subtitle">Knowledge Graph Builder</div>
+  </div>
+</div>
+
+<div class="body">
+  <div id="status" class="status checking">
+    <div class="dot"></div>
+    <span id="status-text">Checking server...</span>
+  </div>
+
+  <button id="btn-extract" class="btn btn-primary" disabled>
+    ⚡ Save conversation now
+  </button>
+
+  <button id="btn-auto" class="btn btn-secondary">
+    🔄 Auto-save: <span id="auto-label">ON</span>
+  </button>
+
+  <div id="msg" class="msg"></div>
+
+  <hr class="divider">
+
+  <div class="hint">
+    Server not running?<br>
+    Open PowerShell and run:<br>
+    <code>python server.py</code>
+  </div>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>

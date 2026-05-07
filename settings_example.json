@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/kg_extractor.py",
+            "async": true
+          }
+        ]
+      }
+    ]
+  },
+  "mcpServers": {
+    "knowledge-graph": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["~/.claude/hooks/kg_mcp_server.py"],
+      "env": {
+        "OBSIDIAN_VAULT": "YOUR_OBSIDIAN_VAULT_PATH_HERE",
+        "KG_FOLDER": "ClaudeCode"
+      }
+    }
+  }
+}
