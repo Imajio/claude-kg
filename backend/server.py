@@ -286,6 +286,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # silence default logging
 
+    def do_GET(self):
+        if self.path == "/ping":
+            self._respond(200, {"status": "ok", "vault": OBSIDIAN_VAULT})
+        else:
+            self._respond(404, {"error": "Not found"})
+
     def do_OPTIONS(self):
         self.send_response(200)
         self._cors()
@@ -327,7 +333,15 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "Not found"})
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "https://claude.ai")
+        origin = self.headers.get("Origin", "")
+        allowed = (
+            origin.startswith("chrome-extension://") or
+            origin == "https://claude.ai"
+        )
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            origin if allowed else "https://claude.ai"
+        )
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
