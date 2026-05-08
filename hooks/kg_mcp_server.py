@@ -3,8 +3,8 @@
 Knowledge Graph MCP Server for Claude Code.
 Exposes KG data as tools Claude can call during sessions.
 
-Install: pip install mcp
-Run via Claude Code settings.json (stdio transport)
+All responses include frequency/weight signals so Claude knows
+which entities matter most — without reading the codebase.
 """
 
 import json
@@ -14,10 +14,31 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
 OBSIDIAN_VAULT = os.getenv("OBSIDIAN_VAULT", str(Path.home() / "ObsidianVault"))
 KG_FOLDER      = os.getenv("KG_FOLDER", "ClaudeCode")
-# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_config() -> dict:
+    defaults = {
+        "mcp": {
+            "importance_tiers": {"core": 20, "important": 8, "moderate": 3},
+            "max_search_results": 10,
+            "max_sessions_in_context": 8,
+        }
+    }
+    config_path = Path.home() / ".claude" / "kg_config.json"
+    if config_path.exists():
+        try:
+            raw = re.sub(r"//.*", "", config_path.read_text(encoding="utf-8"))
+            user = json.loads(raw)
+            if "mcp" in user:
+                defaults["mcp"].update(user["mcp"])
+            defaults.update({k: v for k, v in user.items() if k != "mcp"})
+        except Exception as e:
+            print(f"[KG-MCP] Config error: {e}", file=sys.stderr)
+    return defaults
+
+CFG  = _load_config()
+MCFG = CFG.get("mcp", {})
 
 try:
     from mcp.server import Server
@@ -28,23 +49,18 @@ except ImportError:
     HAS_MCP = False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  KG Reader — all logic for reading Obsidian notes
-# ══════════════════════════════════════════════════════════════════════════════
-
 class KGReader:
     def __init__(self):
         self.vault  = Path(OBSIDIAN_VAULT)
         self.folder = self.vault / KG_FOLDER
 
+    # ── helpers ───────────────────────────────────────────────────────────────
+
     def _read_note(self, path: Path) -> dict:
-        """Parse a markdown note into frontmatter + body."""
         if not path.exists():
             return {}
         text = path.read_text(encoding="utf-8")
-        fm: dict = {}
-        body = text
-
+        fm, body = {}, text
         if text.startswith("---"):
             parts = text.split("---", 2)
             if len(parts) >= 3:
@@ -53,34 +69,66 @@ class KGReader:
                         k, _, v = line.partition(":")
                         fm[k.strip()] = v.strip().strip('"')
                 body = parts[2].strip()
+        return {"frontmatter": fm, "body": body}
 
-        return {"frontmatter": fm, "body": body, "path": str(path)}
+    def _slugify(self, text: str) -> str:
+        text = re.sub(r"[^\w\s-]", "", text.lower())
+        return re.sub(r"[\s_-]+", "-", text).strip("-")[:60]
 
-    def get_recent_sessions(self, n: int = 5) -> list[dict]:
-        """Return the N most recent session notes."""
+    def _excerpt(self, text: str, query: str) -> str:
+        idx = text.lower().find(query)
+        if idx == -1:
+            return ""
+        s, e = max(0, idx - 60), min(len(text), idx + 120)
+        return "..." + text[s:e].replace("\n", " ") + "..."
+
+    def _summary(self, body: str) -> str:
+        for line in body.splitlines():
+            line = line.strip()
+            if line.startswith(">") and len(line) > 5:
+                return line[1:].strip()
+            if len(line) > 30 and not line.startswith("#"):
+                return line[:200]
+        return ""
+
+    def _importance_label(self, mentions: int, rel_count: int) -> str:
+        tiers = MCFG.get("importance_tiers", {"core": 20, "important": 8, "moderate": 3})
+        score = mentions * 2 + rel_count
+        if score >= tiers["core"]:
+            return f"⭐⭐⭐ CORE  (mentioned {mentions}×, {rel_count} relationships)"
+        elif score >= tiers["important"]:
+            return f"⭐⭐ IMPORTANT  (mentioned {mentions}×, {rel_count} relationships)"
+        elif score >= tiers["moderate"]:
+            return f"⭐ MODERATE  (mentioned {mentions}×, {rel_count} relationships)"
+        else:
+            return f"○ LOW  (mentioned {mentions}×, {rel_count} relationships)"
+
+    def _read_entity_signals(self, path: Path) -> dict:
+        """Extract mentions + relationship count from an entity note."""
+        if not path.exists():
+            return {"mentions": 0, "rel_count": 0, "similar": [], "type": "", "title": path.stem}
+        note = self._read_note(path)
+        fm   = note.get("frontmatter", {})
+        body = note.get("body", "")
+
+        mentions  = int(fm.get("mentions", 0))
+        rel_count = len(re.findall(r"\(weight:\s*\d+\)", body))
+        similar   = re.findall(r"\[\[entities/([^\]|]+)[^\]]*\]\]",
+                               body[body.find("## 🔀"):] if "## 🔀" in body else "")
+
+        return {
+            "title":     fm.get("title", path.stem),
+            "type":      fm.get("type", ""),
+            "mentions":  mentions,
+            "rel_count": rel_count,
+            "similar":   similar[:5],
+        }
+
+    # ── tools ─────────────────────────────────────────────────────────────────
+
+    def search(self, query: str) -> str:
         if not self.folder.exists():
-            return []
-
-        notes = []
-        for f in self.folder.glob("????-??-??-*.md"):
-            note = self._read_note(f)
-            if note.get("frontmatter", {}).get("type") == "claude-code-session":
-                notes.append({
-                    "title":   note["frontmatter"].get("title", f.stem),
-                    "date":    note["frontmatter"].get("date", ""),
-                    "tags":    note["frontmatter"].get("tags", ""),
-                    "cwd":     note["frontmatter"].get("cwd", ""),
-                    "summary": self._extract_summary(note["body"]),
-                    "file":    f.name,
-                })
-
-        notes.sort(key=lambda x: x["date"], reverse=True)
-        return notes[:n]
-
-    def search(self, query: str) -> list[dict]:
-        """Full-text search across all KG notes."""
-        if not self.folder.exists():
-            return []
+            return "Knowledge graph is empty — run a Claude Code session first."
 
         query_lower = query.lower()
         results = []
@@ -90,30 +138,53 @@ class KGReader:
                 continue
             try:
                 text = f.read_text(encoding="utf-8")
-                if query_lower in text.lower():
-                    note = self._read_note(f)
-                    fm   = note.get("frontmatter", {})
-                    # Count occurrences for relevance
-                    count = text.lower().count(query_lower)
-                    results.append({
-                        "file":    str(f.relative_to(self.folder)),
-                        "title":   fm.get("title", f.stem),
-                        "type":    fm.get("type", "unknown"),
-                        "matches": count,
-                        "excerpt": self._find_excerpt(text, query_lower),
-                    })
+                if query_lower not in text.lower():
+                    continue
+                note     = self._read_note(f)
+                fm       = note.get("frontmatter", {})
+                matches  = text.lower().count(query_lower)
+                mentions = int(fm.get("mentions", 0))
+                # Combined relevance: text matches + entity importance
+                score    = matches + mentions * 2
+                results.append({
+                    "title":    fm.get("title", f.stem),
+                    "type":     fm.get("type", ""),
+                    "mentions": mentions,
+                    "score":    score,
+                    "excerpt":  self._excerpt(text, query_lower),
+                    "is_entity": "entities" in str(f),
+                })
             except Exception:
                 pass
 
-        results.sort(key=lambda x: x["matches"], reverse=True)
-        return results[:10]
+        if not results:
+            return f'No results for "{query}" in the knowledge graph.'
 
-    def get_entity(self, name: str) -> dict:
-        """Get full details of an entity by name."""
+        results.sort(key=lambda x: x["score"], reverse=True)
+
+        lines = [f'Search results for "{query}" — sorted by relevance + importance:\n']
+        for r in results[:10]:
+            signals = self._read_entity_signals(
+                self.folder / "entities" / f"{self._slugify(r['title'])}.md"
+            ) if r["is_entity"] else {}
+            importance = self._importance_label(
+                signals.get("mentions", r["mentions"]),
+                signals.get("rel_count", 0)
+            ) if r["is_entity"] else ""
+            lines.append(f"### {r['title']} ({r['type']})")
+            if importance:
+                lines.append(f"Importance: {importance}")
+            if r["excerpt"]:
+                lines.append(f"Context: {r['excerpt']}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+
+    def get_entity(self, name: str) -> str:
         slug = self._slugify(name)
         path = self.folder / "entities" / f"{slug}.md"
 
-        # Try fuzzy match if exact not found
         if not path.exists():
             entity_dir = self.folder / "entities"
             if entity_dir.exists():
@@ -123,124 +194,198 @@ class KGReader:
                         break
 
         if not path.exists():
-            return {"error": f"Entity '{name}' not found"}
+            return f"Entity '{name}' not found in knowledge graph."
 
-        note = self._read_note(path)
-        return {
-            "name":    note["frontmatter"].get("title", name),
-            "type":    note["frontmatter"].get("type", ""),
-            "content": note["body"],
-        }
+        note    = self._read_note(path)
+        fm      = note.get("frontmatter", {})
+        body    = note.get("body", "")
+        signals = self._read_entity_signals(path)
 
-    def get_project_context(self, cwd: str) -> dict:
-        """Get all sessions and entities related to a project path."""
+        lines = [
+            f"# {signals['title']} ({signals['type']})",
+            f"Importance: {self._importance_label(signals['mentions'], signals['rel_count'])}",
+        ]
+        if signals["similar"]:
+            lines.append(f"Semantically similar to: {', '.join(signals['similar'])}")
+        lines += ["", body]
+
+        return "\n".join(lines)
+
+
+    def get_project_context(self, cwd: str) -> str:
         if not self.folder.exists():
-            return {"sessions": [], "entities": []}
+            return "No knowledge graph found. Complete a Claude Code session first."
 
         cwd_lower  = cwd.lower().replace("\\", "/")
         sessions   = []
         entity_set = set()
 
         for f in self.folder.glob("????-??-??-*.md"):
-            note = self._read_note(f)
-            fm   = note.get("frontmatter", {})
+            note     = self._read_note(f)
+            fm       = note.get("frontmatter", {})
             note_cwd = fm.get("cwd", "").lower().replace("\\", "/")
-
             if cwd_lower in note_cwd or note_cwd in cwd_lower:
                 sessions.append({
                     "title":   fm.get("title", f.stem),
                     "date":    fm.get("date", ""),
-                    "summary": self._extract_summary(note["body"]),
-                    "file":    f.name,
+                    "summary": self._summary(note.get("body", "")),
                 })
-                # Collect entity links from this session
-                for m in re.finditer(r"\[\[entities/([^\]|]+)", note["body"]):
+                for m in re.finditer(r"\[\[entities/([^\]|]+)", note.get("body", "")):
                     entity_set.add(m.group(1))
 
         sessions.sort(key=lambda x: x["date"], reverse=True)
 
-        entities = []
-        for slug in list(entity_set)[:20]:
-            ep = self.folder / "entities" / f"{slug}.md"
-            if ep.exists():
-                en = self._read_note(ep)
-                entities.append({
-                    "name": en["frontmatter"].get("title", slug),
-                    "type": en["frontmatter"].get("type", ""),
-                    "desc": en["body"].split("\n")[0][:120] if en["body"] else "",
-                })
+        # Load entity signals and sort by importance
+        entity_signals = []
+        for slug in entity_set:
+            ep      = self.folder / "entities" / f"{slug}.md"
+            signals = self._read_entity_signals(ep)
+            entity_signals.append(signals)
 
-        return {"sessions": sessions[:10], "entities": entities}
+        entity_signals.sort(
+            key=lambda x: x["mentions"] * 2 + x["rel_count"],
+            reverse=True
+        )
 
-    def get_decisions(self, project_filter: str = "") -> list[dict]:
-        """Get all decisions made across sessions, optionally filtered by project."""
+        lines = [f"## Project context for {cwd}\n"]
+
+        if not sessions:
+            lines.append("No previous sessions for this project.")
+        else:
+            lines.append(f"### Previous sessions ({len(sessions)})\n")
+            for s in sessions[:8]:
+                lines.append(f"**{s['date']} — {s['title']}**")
+                lines.append(f"  {s['summary']}\n")
+
+        if entity_signals:
+            lines.append(f"\n### Known entities — sorted by importance\n")
+            lines.append("Use this to prioritize where to focus. High-importance entities")
+            lines.append("appear frequently and have many relationships — they are the core of this codebase.\n")
+
+            # Group by importance tier
+            core       = [e for e in entity_signals if e["mentions"]*2+e["rel_count"] >= 20]
+            important  = [e for e in entity_signals if 8 <= e["mentions"]*2+e["rel_count"] < 20]
+            moderate   = [e for e in entity_signals if 3 <= e["mentions"]*2+e["rel_count"] < 8]
+            low        = [e for e in entity_signals if e["mentions"]*2+e["rel_count"] < 3]
+
+            if core:
+                lines.append("**⭐⭐⭐ CORE — always relevant:**")
+                for e in core:
+                    sim = f" ~ {', '.join(e['similar'][:2])}" if e["similar"] else ""
+                    lines.append(f"  • {e['title']} ({e['type']}) — {e['mentions']}× mentioned, {e['rel_count']} relationships{sim}")
+                lines.append("")
+
+            if important:
+                lines.append("**⭐⭐ IMPORTANT — frequently used:**")
+                for e in important:
+                    lines.append(f"  • {e['title']} ({e['type']}) — {e['mentions']}× mentioned, {e['rel_count']} relationships")
+                lines.append("")
+
+            if moderate:
+                lines.append("**⭐ MODERATE — contextually relevant:**")
+                for e in moderate:
+                    lines.append(f"  • {e['title']} ({e['type']}) — {e['mentions']}×")
+                lines.append("")
+
+            if low:
+                lines.append(f"**○ LOW — {len(low)} rarely-mentioned entities** (omitted for brevity)")
+                lines.append("")
+
+        return "\n".join(lines)
+
+
+    def get_decisions(self, project_filter: str = "") -> str:
         if not self.folder.exists():
-            return []
+            return "No decisions documented yet."
 
         decisions = []
         for f in self.folder.glob("????-??-??-*.md"):
             note = self._read_note(f)
             fm   = note.get("frontmatter", {})
-
-            if project_filter:
-                cwd = fm.get("cwd", "").lower()
-                if project_filter.lower() not in cwd:
-                    continue
-
-            # Extract decisions section
-            body = note["body"]
-            in_decisions = False
-            current: dict = {}
-
+            if project_filter and project_filter.lower() not in fm.get("cwd", "").lower():
+                continue
+            body, in_dec, cur = note.get("body", ""), False, {}
             for line in body.splitlines():
-                if line.startswith("## ⚡") or line.startswith("## Decisions"):
-                    in_decisions = True
+                if "## ⚡" in line or "## Decisions" in line:
+                    in_dec = True
                     continue
-                if in_decisions and line.startswith("## "):
-                    in_decisions = False
-                    if current:
-                        decisions.append(current)
-                        current = {}
-                if in_decisions:
+                if in_dec and line.startswith("## "):
+                    in_dec = False
+                    if cur:
+                        decisions.append(cur)
+                        cur = {}
+                if in_dec:
                     if line.startswith("### "):
-                        if current:
-                            decisions.append(current)
-                        current = {
-                            "decision": line[4:].strip(),
-                            "session":  fm.get("title", f.stem),
-                            "date":     fm.get("date", ""),
-                            "rationale": "",
-                        }
-                    elif line.startswith("**Rationale:**") and current:
-                        current["rationale"] = line.replace("**Rationale:**", "").strip()
+                        if cur:
+                            decisions.append(cur)
+                        cur = {"decision": line[4:].strip(), "session": fm.get("title", ""), "date": fm.get("date", ""), "rationale": ""}
+                    elif "**Rationale:**" in line and cur:
+                        cur["rationale"] = line.replace("**Rationale:**", "").strip()
+            if cur:
+                decisions.append(cur)
 
-            if current:
-                decisions.append(current)
+        if not decisions:
+            return "No architectural decisions documented yet."
 
         decisions.sort(key=lambda x: x["date"], reverse=True)
-        return decisions[:20]
+        lines = [f"## Documented decisions ({len(decisions)})\n",
+                 "Review these before making architectural choices — they capture past reasoning.\n"]
+        for d in decisions[:20]:
+            lines.append(f"**{d['date']} — {d['decision']}**")
+            if d["rationale"]:
+                lines.append(f"  Rationale: {d['rationale']}")
+            lines.append(f"  Session: {d['session']}\n")
+        return "\n".join(lines)
 
-    def _extract_summary(self, body: str) -> str:
-        for line in body.splitlines():
-            line = line.strip()
-            if line.startswith(">") and len(line) > 5:
-                return line[1:].strip()
-            if len(line) > 30 and not line.startswith("#"):
-                return line[:200]
-        return ""
 
-    def _find_excerpt(self, text: str, query: str) -> str:
-        idx = text.lower().find(query)
-        if idx == -1:
-            return ""
-        start = max(0, idx - 60)
-        end   = min(len(text), idx + 120)
-        return "..." + text[start:end].replace("\n", " ") + "..."
+    def get_hot_entities(self, n: int = 10) -> str:
+        """Return top N entities by importance score — Claude's attention map."""
+        entity_dir = self.folder / "entities"
+        if not entity_dir.exists():
+            return "No entities yet."
 
-    def _slugify(self, text: str) -> str:
-        text = re.sub(r"[^\w\s-]", "", text.lower())
-        text = re.sub(r"[\s_-]+", "-", text).strip("-")
-        return text[:60]
+        entities = []
+        for f in entity_dir.glob("*.md"):
+            signals = self._read_entity_signals(f)
+            score   = signals["mentions"] * 2 + signals["rel_count"]
+            entities.append((score, signals))
+
+        entities.sort(reverse=True)
+
+        lines = [
+            f"## Top {n} entities by importance\n",
+            "This is your codebase's attention map — the higher the score,",
+            "the more central this entity is to the project.\n",
+            f"{'Entity':<30} {'Type':<15} {'Mentions':>8} {'Rels':>5} {'Score':>6}",
+            "-" * 70,
+        ]
+        for score, s in entities[:n]:
+            sim = f"  ~ {s['similar'][0]}" if s["similar"] else ""
+            lines.append(
+                f"{s['title']:<30} {s['type']:<15} {s['mentions']:>8} {s['rel_count']:>5} {score:>6}{sim}"
+            )
+        return "\n".join(lines)
+
+
+    def get_recent_sessions(self, n: int = 5) -> str:
+        if not self.folder.exists():
+            return "No sessions yet."
+        notes = []
+        for f in self.folder.glob("????-??-??-*.md"):
+            note = self._read_note(f)
+            fm   = note.get("frontmatter", {})
+            if fm.get("type") == "claude-code-session":
+                notes.append({
+                    "title":   fm.get("title", f.stem),
+                    "date":    fm.get("date", ""),
+                    "cwd":     fm.get("cwd", ""),
+                    "summary": self._summary(note.get("body", "")),
+                })
+        notes.sort(key=lambda x: x["date"], reverse=True)
+        lines = [f"## Last {min(n, len(notes))} sessions\n"]
+        for s in notes[:n]:
+            lines += [f"**{s['date']} — {s['title']}**", f"  Project: {s['cwd']}", f"  {s['summary']}\n"]
+        return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -252,166 +397,85 @@ def run_mcp_server():
     server = Server("knowledge-graph")
 
     @server.list_tools()
-    async def list_tools() -> list[types.Tool]:
+    async def list_tools():
         return [
             types.Tool(
                 name="kg_search",
-                description="Search the knowledge graph for entities, concepts, files, or decisions. Use this before exploring the codebase to check if something is already documented.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search term (e.g. 'auth', 'JWT', 'database migration')"
-                        }
-                    },
-                    "required": ["query"]
-                }
+                description=(
+                    "Search the knowledge graph by keyword. Results are ranked by relevance AND entity importance "
+                    "(mentions × sessions). Use this before exploring files — the KG may already know the answer "
+                    "and tell you which entities are most important."
+                ),
+                inputSchema={"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
             ),
             types.Tool(
                 name="kg_get_entity",
-                description="Get full details about a specific entity (file, concept, library, etc.) from the knowledge graph, including its relationships and which sessions it appeared in.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Entity name (e.g. 'AuthService', 'jose', 'UserModel')"
-                        }
-                    },
-                    "required": ["name"]
-                }
+                description=(
+                    "Get full details about an entity including its importance score, relationship weights, "
+                    "and semantically similar entities. Higher importance = more central to the codebase."
+                ),
+                inputSchema={"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
             ),
             types.Tool(
                 name="kg_project_context",
-                description="Get all previously documented sessions, entities, and decisions for the current project. Call this at the start of a session to understand what has been done before.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "cwd": {
-                            "type": "string",
-                            "description": "Project directory path"
-                        }
-                    },
-                    "required": ["cwd"]
-                }
+                description=(
+                    "Get all sessions and entities for the current project, grouped by importance tier: "
+                    "CORE / IMPORTANT / MODERATE / LOW. Use this at session start to understand "
+                    "what matters most without reading files."
+                ),
+                inputSchema={"type":"object","properties":{"cwd":{"type":"string"}},"required":["cwd"]}
+            ),
+            types.Tool(
+                name="kg_hot_entities",
+                description=(
+                    "Get the top N most important entities sorted by importance score "
+                    "(mentions × 2 + relationship count). This is the codebase attention map — "
+                    "tells you where complexity and activity concentrate."
+                ),
+                inputSchema={"type":"object","properties":{"n":{"type":"integer","default":10}}}
             ),
             types.Tool(
                 name="kg_get_decisions",
-                description="Get all architectural decisions and conclusions documented across sessions. Useful before making technology choices or architectural changes.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project_filter": {
-                            "type": "string",
-                            "description": "Optional: filter by project path substring"
-                        }
-                    }
-                }
+                description="Get all architectural decisions and their rationale. Check before making tech choices.",
+                inputSchema={"type":"object","properties":{"project_filter":{"type":"string"}}}
             ),
             types.Tool(
                 name="kg_recent_sessions",
-                description="Get the most recent Claude Code sessions with their summaries.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "n": {
-                            "type": "integer",
-                            "description": "Number of sessions to return (default: 5)"
-                        }
-                    }
-                }
+                description="Get the most recent sessions with summaries.",
+                inputSchema={"type":"object","properties":{"n":{"type":"integer","default":5}}}
             ),
         ]
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    async def call_tool(name: str, arguments: dict):
         try:
             if name == "kg_search":
-                results = kg.search(arguments.get("query", ""))
-                if not results:
-                    text = "No results found in knowledge graph."
-                else:
-                    lines = [f"Found {len(results)} results:\n"]
-                    for r in results:
-                        lines.append(f"**{r['title']}** ({r['type']})")
-                        lines.append(f"  {r['excerpt']}\n")
-                    text = "\n".join(lines)
-
+                text = kg.search(arguments.get("query", ""))
             elif name == "kg_get_entity":
-                result = kg.get_entity(arguments.get("name", ""))
-                if "error" in result:
-                    text = result["error"]
-                else:
-                    text = f"# {result['name']} ({result['type']})\n\n{result['content']}"
-
+                text = kg.get_entity(arguments.get("name", ""))
             elif name == "kg_project_context":
-                result = kg.get_project_context(arguments.get("cwd", ""))
-                lines  = []
-                if result["sessions"]:
-                    lines.append(f"## Previous sessions ({len(result['sessions'])})\n")
-                    for s in result["sessions"]:
-                        lines.append(f"**{s['date']} — {s['title']}**")
-                        lines.append(f"  {s['summary']}\n")
-                else:
-                    lines.append("No previous sessions for this project.")
-                if result["entities"]:
-                    lines.append(f"\n## Known entities ({len(result['entities'])})\n")
-                    for e in result["entities"]:
-                        lines.append(f"- **{e['name']}** ({e['type']}): {e['desc']}")
-                text = "\n".join(lines)
-
+                text = kg.get_project_context(arguments.get("cwd", ""))
+            elif name == "kg_hot_entities":
+                text = kg.get_hot_entities(arguments.get("n", 10))
             elif name == "kg_get_decisions":
-                results = kg.get_decisions(arguments.get("project_filter", ""))
-                if not results:
-                    text = "No decisions documented yet."
-                else:
-                    lines = [f"## Documented decisions ({len(results)})\n"]
-                    for d in results:
-                        lines.append(f"**{d['date']} — {d['decision']}**")
-                        if d["rationale"]:
-                            lines.append(f"  Rationale: {d['rationale']}")
-                        lines.append(f"  Session: {d['session']}\n")
-                    text = "\n".join(lines)
-
+                text = kg.get_decisions(arguments.get("project_filter", ""))
             elif name == "kg_recent_sessions":
-                n       = arguments.get("n", 5)
-                results = kg.get_recent_sessions(n)
-                if not results:
-                    text = "No sessions in knowledge graph yet."
-                else:
-                    lines = [f"## Last {len(results)} sessions\n"]
-                    for s in results:
-                        lines.append(f"**{s['date']} — {s['title']}**")
-                        lines.append(f"  Project: {s['cwd']}")
-                        lines.append(f"  {s['summary']}\n")
-                    text = "\n".join(lines)
-
+                text = kg.get_recent_sessions(arguments.get("n", 5))
             else:
                 text = f"Unknown tool: {name}"
-
         except Exception as e:
             text = f"Error: {e}"
-
         return [types.TextContent(type="text", text=text)]
 
     import asyncio
-
     async def main():
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(read_stream, write_stream, server.create_initialization_options())
-
+        async with stdio_server() as (r, w):
+            await server.run(r, w, server.create_initialization_options())
     asyncio.run(main())
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Fallback — if mcp not installed, print install instructions
-# ══════════════════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     if not HAS_MCP:
-        print("ERROR: mcp package not installed.", file=sys.stderr)
-        print("Run: pip install mcp", file=sys.stderr)
+        print("ERROR: run: pip install mcp", file=sys.stderr)
         sys.exit(1)
-
     run_mcp_server()

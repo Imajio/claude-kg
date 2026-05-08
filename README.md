@@ -25,31 +25,43 @@ Every time you start a new Claude Code session, Claude starts from zero. It has 
 ## How it works
 
 ```
+Claude Code session starts
+        │
+        ▼  SessionStart hook (optional)
+  hooks/kg_session_start.py
+        │
+        └─ injects previous context into Claude (if enabled in config)
+
+                    ┄┄┄ session happens ┄┄┄
+
 Claude Code session ends
         │
         ▼  SessionEnd hook
   hooks/kg_extractor.py
         │
         ├─ reads transcript.jsonl
-        ├─ calls Claude API (extracts entities, relationships, decisions)
+        ├─ calls Claude API to extract entities, relationships, decisions
+        ├─ tracks mention counts and relationship weights
+        ├─ finds semantically similar entities
         │
         ▼
   Obsidian Vault/ClaudeCode/
-        ├─ INDEX.md
-        ├─ 2025-01-15-refactored-auth.md
+        ├─ INDEX.md                              ← all sessions + hot entities
+        ├─ 2025-01-15-refactored-auth.md         ← session note
         └─ entities/
-            ├─ auth-service.md
-            └─ jose-library.md
+            ├─ auth-service.md                   ← CORE  (8×, 6 rels)
+            └─ jose-library.md                   ← IMPORTANT (5×, 2 rels)
 
-Next session starts
+During next session
         │
         ▼  MCP server
   hooks/kg_mcp_server.py
         │
-        ├─ kg_search("auth")           → find relevant entities
-        ├─ kg_project_context(cwd)     → load project history
+        ├─ kg_search("auth")          → ranked by relevance + importance
+        ├─ kg_project_context(cwd)    → entities grouped by importance tier
         ├─ kg_get_entity("AuthService")
-        └─ kg_get_decisions()          → see past architectural choices
+        ├─ kg_hot_entities()          → codebase attention map
+        └─ kg_get_decisions()         → past architectural choices
 ```
 
 ---
@@ -59,11 +71,13 @@ Next session starts
 ```
 claude-kg/
 ├── install.py               # One-command installer (Windows, macOS, Linux)
+├── kg_config.json           # All settings — copy to ~/.claude/kg_config.json
 ├── settings_example.json    # Claude Code settings.json template
 │
-├── hooks/                   # Drop these into ~/.claude/hooks/
-│   ├── kg_extractor.py      # SessionEnd hook — builds KG after each session
-│   └── kg_mcp_server.py     # MCP server — exposes KG as tools to Claude Code
+├── hooks/                   # Copy these to ~/.claude/hooks/
+│   ├── kg_extractor.py      # SessionEnd — builds KG after each session
+│   ├── kg_mcp_server.py     # MCP server — exposes KG as tools to Claude
+│   └── kg_session_start.py  # SessionStart — injects context (opt-in)
 │
 ├── extension/               # Chrome extension for claude.ai conversations
 │   ├── manifest.json
@@ -85,7 +99,7 @@ claude-kg/
 - Python 3.10+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 - [Obsidian](https://obsidian.md)
-- Anthropic API key — get one at [console.anthropic.com](https://console.anthropic.com)
+- Anthropic API key - get one at [console.anthropic.com](https://console.anthropic.com)
 
 ### One-command install
 
@@ -97,22 +111,99 @@ python install.py
 ```
 
 The installer will:
-- Copy `hooks/kg_extractor.py` and `hooks/kg_mcp_server.py` to `~/.claude/hooks/`
+- Copy all three hook scripts to `~/.claude/hooks/`
 - Ask for your Obsidian vault path and API key
 - Update `~/.claude/settings.json` automatically
 - Set environment variables
 
 That's it. Restart Claude Code and start a session.
 
-### Manual install (optional)
+### Manual install
 
-If you prefer to set things up yourself, see `settings_example.json` for the full `settings.json` template. You need three environment variables:
+Copy the three hook scripts:
+
+**Windows:**
+```powershell
+mkdir "$env:USERPROFILE\.claude\hooks" -Force
+copy hooks\kg_extractor.py     "$env:USERPROFILE\.claude\hooks\"
+copy hooks\kg_mcp_server.py    "$env:USERPROFILE\.claude\hooks\"
+copy hooks\kg_session_start.py "$env:USERPROFILE\.claude\hooks\"
+```
+
+**macOS / Linux:**
+```bash
+mkdir -p ~/.claude/hooks
+cp hooks/kg_extractor.py     ~/.claude/hooks/
+cp hooks/kg_mcp_server.py    ~/.claude/hooks/
+cp hooks/kg_session_start.py ~/.claude/hooks/
+```
+
+Then merge `settings_example.json` into your `~/.claude/settings.json`.
+
+Set three environment variables:
 
 | Variable | Description |
 |---|---|
 | `ANTHROPIC_API_KEY` | Your key from console.anthropic.com |
 | `OBSIDIAN_VAULT` | Full path to your Obsidian vault |
-| `KG_FOLDER` | Subfolder name inside vault (default: `ClaudeCode`) |
+| `KG_FOLDER` | Subfolder inside vault (default: `ClaudeCode`) |
+
+---
+
+## Configuration
+
+Copy `kg_config.json` to `~/.claude/kg_config.json` and edit as needed. All settings are optional — if the file does not exist, defaults are used.
+
+```jsonc
+{
+  "features": {
+    "mentions":    true,  // track how many sessions each entity appears in
+    "weights":     true,  // track relationship weights across sessions
+    "similarity":  true,  // find semantically similar entities
+    "decisions":   true,  // extract architectural decisions
+    "insights":    true,  // extract key insights
+
+    // ⚠️ Injects previous context at session start.
+    // Costs 1,000–5,000 tokens upfront every session.
+    // If false, use kg_project_context via MCP instead (on-demand, cheaper).
+    "auto_context_on_start": false
+  },
+
+  // Only used when auto_context_on_start is true
+  "auto_context": {
+    "max_sessions":       3,
+    "include_entities":   true,
+    "include_decisions":  true,
+    "only_core_entities": true,   // only CORE + IMPORTANT entities (saves tokens)
+    "max_tokens_hint":    2000    // trims context if it exceeds this
+  },
+
+  "mcp": {
+    "importance_tiers": {
+      "core":      20,  // score >= 20 → ⭐⭐⭐ CORE
+      "important":  8,  // score >= 8  → ⭐⭐ IMPORTANT
+      "moderate":   3   // score >= 3  → ⭐ MODERATE
+    }
+  }
+}
+```
+
+**Importance score** is calculated as `mentions × 2 + relationship_count`. Entities that appear frequently and connect to many others rank higher — Claude uses this to prioritize attention.
+
+---
+
+## MCP Tools
+
+Claude calls these automatically when it needs to find something:
+
+| Tool | Description |
+|---|---|
+| `kg_search(query)` | Search by keyword — results ranked by relevance + importance |
+| `kg_get_entity(name)` | Full entity profile with importance score, weights, similar entities |
+| `kg_project_context(cwd)` | All sessions and entities grouped by importance tier |
+| `kg_hot_entities(n?)` | Top N entities by importance score — the codebase attention map |
+| `kg_get_decisions(filter?)` | All architectural decisions, optionally filtered by project |
+| `kg_recent_sessions(n?)` | Last N sessions with summaries |
 
 ---
 
@@ -120,42 +211,27 @@ If you prefer to set things up yourself, see `settings_example.json` for the ful
 
 Captures claude.ai conversations and sends them to the local server.
 
-### Setup
-
-1. Start the local server: run `backend/start_server.bat` (Windows) or `python backend/server.py`
-2. Open `chrome://extensions/`
+1. Start the local server: `backend/start_server.bat` (Windows) or `python backend/server.py`
+2. Open `chrome://extensions/` (or `brave://extensions/`)
 3. Enable **Developer mode**
 4. Click **Load unpacked** → select the `extension/` folder
-5. Set `OBSIDIAN_VAULT` env var and restart the server
 
-The extension auto-sends conversations to the KG after Claude finishes each response. A toast notification confirms when processing starts.
-
----
-
-## MCP Tools available to Claude
-
-| Tool | Description |
-|---|---|
-| `kg_search(query)` | Search entities, sessions, decisions by keyword |
-| `kg_get_entity(name)` | Full profile of an entity with relationships |
-| `kg_project_context(cwd)` | All sessions and entities for the current project |
-| `kg_get_decisions(filter?)` | All architectural decisions, optionally filtered by project |
-| `kg_recent_sessions(n?)` | Last N sessions with summaries |
-
-Claude calls these automatically when it needs to find something — no manual prompting needed.
+The extension auto-sends conversations after each Claude response. A toast confirms when processing starts. You can also trigger it manually via the extension popup.
 
 ---
 
 ## Obsidian setup
 
-Recommended plugins (Community Plugins):
+Recommended Community Plugins:
 
-- **Dataview** — query sessions like a database
-- **Juggl** — enhanced graph with relationship types
-- **Graph Analysis** — relationship strength visualization
-- **Strange New Worlds** — backlink counts inline
+| Plugin | Purpose |
+|---|---|
+| **Dataview** | Query sessions like a database |
+| **Juggl** | Enhanced graph with relationship types |
+| **Graph Analysis** | Relationship strength visualization |
+| **Strange New Worlds** | Backlink counts inline |
 
-Example Dataview query — all sessions this week:
+Example Dataview query — sessions this week:
 ```dataview
 TABLE date, cwd, tags
 FROM "ClaudeCode"
@@ -170,19 +246,22 @@ SORT date DESC
 
 **Notes not appearing after session:**
 ```powershell
-# Test the extractor manually (Windows)
+# Test manually (Windows)
 $t = "PATH\TO\YOUR\session.jsonl"
 echo "{`"transcript_path`":`"$t`",`"session_id`":`"test`",`"cwd`":`"C:/`"}" | python "$env:USERPROFILE\.claude\hooks\kg_extractor.py"
 ```
 
 **MCP server not connecting:**
 ```bash
+pip install mcp
 python ~/.claude/hooks/kg_mcp_server.py
-# Should start without errors if mcp package is installed
 ```
 
 **API 404 error:**
-Make sure `MODEL` in `kg_extractor.py` matches an available model. Current default: `claude-sonnet-4-6`.
+Check that `MODEL` in `kg_extractor.py` matches an available model. Default: `claude-sonnet-4-6`.
+
+**Extension can't reach server:**
+Make sure `backend/start_server.bat` is running. The popup shows **Server running ✓** when connected.
 
 ---
 

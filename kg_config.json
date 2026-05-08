@@ -1,0 +1,53 @@
+# claude-kg configuration
+# Copy this file to ~/.claude/kg_config.json and edit as needed.
+# All settings are optional — defaults are shown below.
+
+{
+  // ── Core ──────────────────────────────────────────────────────────────────
+  "model": "claude-sonnet-4-6",        // Claude model used for extraction
+  "min_session_length": 100,           // Skip sessions shorter than N chars
+  "kg_folder": "ClaudeCode",           // Subfolder inside your Obsidian vault
+
+  // ── Features ──────────────────────────────────────────────────────────────
+  "features": {
+    "mentions":    true,   // Track how many sessions each entity appears in
+    "weights":     true,   // Track relationship weights across sessions
+    "similarity":  true,   // Find semantically similar entities via Claude API
+    "decisions":   true,   // Extract architectural decisions
+    "insights":    true,   // Extract key insights
+    "hot_index":   true,   // Show most active entities in INDEX.md
+
+    // ⚠️  AUTO CONTEXT ON START
+    // Automatically injects previous session context at the start of every
+    // Claude Code session. Claude will immediately know what was done before
+    // without you explaining anything.
+    //
+    // WARNING: This consumes tokens at the start of every session.
+    // Depending on your project size, this can use 1,000-5,000 tokens upfront.
+    // Recommended only if you work on the same project across many sessions.
+    // If you prefer on-demand context, leave this false and use kg_project_context
+    // via MCP instead - it's called only when Claude actually needs it.
+    "auto_context_on_start": true
+  },
+
+  // ── Auto context settings (only used if auto_context_on_start = true) ─────
+  "auto_context": {
+    "max_sessions":       3,     // How many past sessions to include
+    "include_entities":   true,  // Include entity importance table
+    "include_decisions":  true,  // Include past architectural decisions
+    "only_core_entities": true,  // Only include CORE + IMPORTANT entities (saves tokens)
+    "max_tokens_hint":    8000   // Soft cap - context is trimmed to roughly this size
+  },
+
+  // ── MCP server ────────────────────────────────────────────────────────────
+  "mcp": {
+    "importance_tiers": {
+      "core":      20,    // score >= this -> CORE
+      "important":  8,    // score >= this -> IMPORTANT
+      "moderate":   3     // score >= this -> MODERATE
+    },
+    "importance_formula": "mentions * 2 + relationships",
+    "max_search_results": 10,
+    "max_sessions_in_context": 8
+  }
+}

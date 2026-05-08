@@ -1,5 +1,15 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ~/.claude/hooks/kg_session_start.py"
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "hooks": [
